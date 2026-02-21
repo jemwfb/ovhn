@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MASON 3.0 — Clinical Event Stream → Pathway Lifecycle → Episode Settlement</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+  html, body, #root { margin:0; padding:0; height:100%; overflow:hidden; background:#f8fafc; zoom: 120%; }
+  @keyframes fadeSlideIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  ::-webkit-scrollbar { width:4px; } ::-webkit-scrollbar-track { background:#f8fafc; } ::-webkit-scrollbar-thumb { background:#e2e8f0; border-radius:2px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+/* ═══════════════════════════════════════════════════════════════
+   COLOR SYSTEM — light theme with high contrast
+   ═══════════════════════════════════════════════════════════════ */
+const C = {
+  bg: "#f8fafc", bgPanel: "#ffffff", bgCard: "#f1f5f9", bgRow: "#e2e8f0",
+  border: "#e2e8f0", borderHi: "#cbd5e1",
+  text: "#0f172a", dim: "#334155", muted: "#64748b", faint: "#94a3b8",
+  clinical: "#2563EB", lab: "#7C3AED", pharmacy: "#DB2777",
+  claims: "#B45309", admin: "#475569", iot: "#059669", imaging: "#0891B2",
+  scribe: "#7C3AED", monitor: "#059669", referral: "#B45309",
+  auth: "#E11D48", pathway: "#2563EB",
+  drug: "#DB2777", facility: "#B45309", professional: "#2563EB",
+  mgmt: "#7C3AED", savings: "#059669", target: "#EA580C",
+  unclicked: "#DC2626",
+};
+
+const PATHWAY_STATES = [
+  { id: "enrollment", label: "Enrollment", diagram: "D1", color: "#64748B", desc: "Patient Selection & MASON Enrollment", detail: "Referral screening, eligibility check, payer status, exclusion criteria (benign heme, BMT, CAR-T, hospice)" },
+  { id: "diagnostic", label: "Diagnostic", diagram: "D2", color: "#7C3AED", desc: "Diagnostic Evaluation", detail: "Suspected malignancy workup. Goal: appointment within 72 hrs. Parallel clinical + financial pre-work. Ends: benign (exit) or malignant (continue)" },
+  { id: "staging", label: "Staging", diagram: "D3", color: "#2563EB", desc: "Staging & Treatment Planning", detail: "\"Consultation sandwich\" (Visit 1 → Work-up → Visit 2). Pathway selection, shared decision. EMR documentation = Master Trigger → OPC + Target Price" },
+  { id: "treatment-init", label: "Tx Initiation", diagram: "D4", color: "#0891B2", desc: "Treatment Initiation & Coordination", detail: "Prior auth, drug fulfillment (oral/IV), multidisciplinary education (pharmacist, NP, financial counselor), PBM coordination for MA plans" },
+  { id: "active-treatment", label: "Active Tx", diagram: "D5", color: "#059669", desc: "Active Treatment & Triage Management", detail: "Infusion cycles, toxicity monitoring, nurse-driven triage (COME HOME model), restaging, dose adjustments. If progression → episode closes, new episode starts" },
+  { id: "settlement", label: "Settlement", diagram: "D6", color: "#EA580C", desc: "Episode Settlement & Shared Savings", detail: "Episode closed. Virtual Account finalized: Total Spend vs. Target Price. Quality metrics compiled. Shared savings calculated if quality parameters met" },
+];
+
+const EVENTS = [
+  { id: 0, time: "Day 0  08:14", topic: "emr.referral", type: "clinical", typeLabel: "EMR", fhir: "Condition, Patient", source: "PCP Referral", event: "New patient referral received — suspected breast mass, biopsy pending. Practice staff calls patient, schedules within 72 hours", pathwayState: "enrollment", pathwayTransition: "diagnostic", agents: [{ id: "scribe", action: "Ingests referral via NLP; creates Patient + Condition (preliminary). Flags payer status: Medicare Advantage" }, { id: "pathway", action: "Applies MASON enrollment criteria: not benign heme, not BMT/CAR-T, not hospice. Patient eligible → enrolled in MASON. Advances to Diagnostic Evaluation" }], ledger: null, totalSpent: 0 },
+  { id: 1, time: "Day 3  11:22", topic: "lab.pathology", type: "lab", typeLabel: "LAB", fhir: "DiagnosticReport, Observation", source: "Pathology Lab", event: "Pathology result: Invasive ductal carcinoma, HER2 IHC 3+, ER/PR negative. Malignancy CONFIRMED — diagnostic episode ends, staging begins", pathwayState: "diagnostic", pathwayTransition: "staging", agents: [{ id: "scribe", action: "Extracts diagnosis from pathology report via NLP. Creates Condition resource: HER2+ breast carcinoma. Malignancy confirmed → diagnostic episode complete" }, { id: "pathway", action: "Detects confirmed malignancy. Transitions pathway from Diagnostic to Staging. Notifies PCC to schedule staging tests (genomics, imaging) and Visit 2 follow-up" }], ledger: null, totalSpent: 0 },
+  { id: 2, time: "Day 8  14:30", topic: "emr.staging", type: "clinical", typeLabel: "EMR", fhir: "Observation (staging), DiagnosticReport (CT/PET)", source: "Practice (PCC aggregation)", event: "All staging results in EMR: T2N1M0, Stage IIIA. PCC has aggregated genomics, imaging, labs per McAneny workflow", pathwayState: "staging", pathwayTransition: null, agents: [{ id: "scribe", action: "Documents staging data: T2N1M0, HER2 IHC 3+, ER−, PR−, Ki-67 40%. Populates Observation resources for each staging element" }, { id: "pathway", action: "Pre-matches to NCCN pathway templates based on staging data. Identifies candidate regimen: TCHP (Docetaxel/Carboplatin/Trastuzumab/Pertuzumab). Prepares OPC category: Breast-HER2+-III" }], ledger: null, totalSpent: 0 },
+  { id: 3, time: "Day 12  09:05", topic: "emr.careplan", type: "clinical", typeLabel: "EMR", fhir: "CarePlan, EpisodeOfCare", source: "Oncologist (Dr. McAneny)", event: "MASTER TRIGGER: Oncologist documents agreed-upon TCHP treatment plan in EMR after Visit 2. Patient decision recorded. Pathway adherence: NCCN-aligned", pathwayState: "staging", pathwayTransition: "treatment-init", agents: [{ id: "pathway", action: "MASTER TRIGGER detected: treatment plan documented in EMR. Creates CarePlan + EpisodeOfCare. Assigns OPC: Breast-HER2+-III. Calculates Optimal Target Price: $87,400. Opens Virtual Account. Communicates Target Price to practice and payer" }, { id: "scribe", action: "Documents treatment decision, NCCN pathway adherence rationale, patient consent, and shared decision-making in CarePlan narrative" }], ledger: null, totalSpent: 0 },
+  { id: 4, time: "Day 12  09:08", topic: "admin.coverage", type: "admin", typeLabel: "ADMIN", fhir: "Coverage, ClaimResponse", source: "MA Payer API (Da Vinci CRD)", event: "Prior authorization request auto-submitted for TCHP regimen. MA plan detected — PA required for Pertuzumab. PBM coordination initiated for any oral components", pathwayState: "treatment-init", pathwayTransition: null, agents: [{ id: "auth", action: "Reads Coverage; detects MA plan requires PA for Pertuzumab. Auto-completes DTR template. Submits CRD request. Pharmacist alerted to begin PBM coordination for oral components" }], ledger: null, totalSpent: 0 },
+  { id: 5, time: "Day 13  14:33", topic: "admin.coverage", type: "admin", typeLabel: "ADMIN", fhir: "ClaimResponse (approved)", source: "MA Payer API", event: "Prior authorization APPROVED for TCHP ×6 cycles. Auth# MA-2026-44891. Multidisciplinary education team activated", pathwayState: "treatment-init", pathwayTransition: null, agents: [{ id: "auth", action: "Updates ServiceRequest status → approved. Records auth number. Clears drug fulfillment for IV regimen" }, { id: "pathway", action: "PA cleared. Activates multidisciplinary education workflow: Pharmacist (regimen review), NP (chemo teaching), Financial Counselor (copay assistance). Schedules Cycle 1 infusion" }, { id: "referral", action: "Initiates radiation oncology pre-referral search. Queries OVHN directory: top 3 candidates by outcome, cost, network status, distance" }], ledger: null, totalSpent: 0 },
+  { id: 6, time: "Day 17 07:45", topic: "pharmacy.dispense", type: "pharmacy", typeLabel: "Rx", fhir: "MedicationDispense", source: "In-House Pharmacy", event: "TCHP drugs dispensed: Docetaxel 75mg/m², Carboplatin AUC6, Trastuzumab 8mg/kg, Pertuzumab 840mg. Pharmacist education complete", pathwayState: "treatment-init", pathwayTransition: "active-treatment", agents: [{ id: "pathway", action: "Records dispense event. Logs vial-level costs + waste. Transitions pathway to Active Treatment. Virtual Account: first drug cost accrued" }], ledger: { category: "Drug Cost", amount: 14200, color: C.drug, icon: "→" }, totalSpent: 14200 },
+  { id: 7, time: "Day 17 08:30", topic: "emr.infusion", type: "clinical", typeLabel: "EMR", fhir: "MedicationAdministration, Observation", source: "Infusion Suite", event: "Cycle 1 Day 1 infusion started. Vitals stable. Chair time: 4.2 hours. Reaction protocol on standby. No immediate reaction. Home instructions given", pathwayState: "active-treatment", pathwayTransition: null, agents: [{ id: "scribe", action: "Captures start/stop times, vitals q15min, nursing assessment, drug administration details. Auto-generates encounter note with infusion documentation" }, { id: "monitor", action: "Activates PCC-39 subscription to patient Observation stream. Loads TCHP toxicity CQL rules: ANC < 1500, LVEF decline > 10%, GI grading ≥ Grade 3. Begins 24/7 surveillance" }], ledger: { category: "Facility Fee", amount: 850, color: C.facility, icon: "→" }, totalSpent: 15050 },
+  { id: 8, time: "Day 17 13:15", topic: "claims.professional", type: "claims", typeLabel: "CLM", fhir: "Claim (unadjudicated)", source: "Practice Billing → Payer Feed", event: "E&M claim submitted: 99215. Unadjudicated claim from payer lands on streaming event log. Virtual Account updated with real-time spend", pathwayState: "active-treatment", pathwayTransition: null, agents: [{ id: "pathway", action: "Ingests unadjudicated claim from payer streaming feed. Accrues E&M to Virtual Account. Remaining Headroom: $72,030" }], ledger: { category: "Professional (E&M)", amount: 320, color: C.professional, icon: "→" }, totalSpent: 15370 },
+  { id: 9, time: "Day 17 13:16", topic: "claims.management", type: "claims", typeLabel: "CLM", fhir: "Claim (PMPM accrual)", source: "MASON Contract Engine", event: "Monthly MASON payment accruals posted: Triage PMPM $250, Data Mgmt PMPM $100, Infusion facility overhead $380. These fund the previously unreimbursed care coordination", pathwayState: "active-treatment", pathwayTransition: null, agents: [{ id: "pathway", action: "Accrues MASON fee-for-value components to Virtual Account: Nurse Triage Fee, Data Management Fee, Infusion Facility Fee. These are the payments that fund the COME HOME triage model" }], ledger: { category: "Care Mgmt Fees", amount: 730, color: C.mgmt, icon: "→" }, totalSpent: 16100 },
+  { id: 10, time: "Day 26 06:42", topic: "lab.results", type: "lab", typeLabel: "LAB", fhir: "Observation (ANC)", source: "Reference Lab (LabCorp)", event: "CBC result: ANC = 1,200 /µL (Grade 2 Neutropenia). Triage nurse alerted within 1 hour per COME HOME SLA. Patient called", pathwayState: "active-treatment", pathwayTransition: null, agents: [{ id: "monitor", action: "CQL RULE FIRES: IF ANC < 1500 AND regimen = TCHP THEN Yellow Zone. Creates Flag (urgent). Sends Communication to triage nurse + patient within 1-hour SLA. Triage nurse activates symptom management protocol" }, { id: "pathway", action: "Evaluates CQL protocol options: (a) hold cycle, (b) dose-reduce docetaxel 25%, (c) add G-CSF prophylaxis. Drafts ServiceRequest for Neulasta (intent=proposal). Routes to oncologist for approval" }, { id: "scribe", action: "Documents toxicity event, ANC value, CQL rule that triggered, triage nurse response time. Creates AdverseEvent FHIR resource" }], ledger: { category: "Lab (external)", amount: 85, color: C.professional, icon: "→" }, totalSpent: 16185 },
+  { id: 11, time: "Day 26 08:10", topic: "emr.order", type: "clinical", typeLabel: "EMR", fhir: "ServiceRequest (intent=order)", source: "Oncologist Approval", event: "MD approves G-CSF prophylaxis (Neulasta 6mg SC). ServiceRequest signed: intent=proposal → intent=order. APC slot reserved for next-day injection", pathwayState: "active-treatment", pathwayTransition: null, agents: [{ id: "pathway", action: "Detects signed order. Adds Neulasta to regimen cost projection. Recalculates: episode still on track vs Target Price. Updates Virtual Account" }, { id: "auth", action: "Auto-checks if Neulasta requires separate PA under MA plan. Result: covered under existing TCHP authorization. No additional PA needed" }], ledger: { category: "Drug Cost (G-CSF)", amount: 6200, color: C.drug, icon: "→" }, totalSpent: 22385 },
+  { id: 12, time: "Day 38 08:20", topic: "pharmacy.dispense", type: "pharmacy", typeLabel: "Rx", fhir: "MedicationAdministration", source: "Infusion Suite", event: "Cycle 2 complete. Neulasta administered Day 2. No Grade ≥3 toxicity. Triage team monitoring continues", pathwayState: "active-treatment", pathwayTransition: null, agents: [{ id: "scribe", action: "Documents Cycle 2 encounter + Neulasta administration. Updates CarePlan progress" }, { id: "pathway", action: "Records Cycle 2 complete. Cumulative drug cost accrued. Virtual Account tracking: on target" }], ledger: { category: "Drug + Facility", amount: 15680, color: C.drug, icon: "→" }, totalSpent: 38065 },
+  { id: 13, time: "Day 59 08:15", topic: "pharmacy.dispense", type: "pharmacy", typeLabel: "Rx", fhir: "MedicationAdministration", source: "Infusion Suite", event: "Cycle 3 complete. Tolerating well with G-CSF prophylaxis. Mid-treatment restaging triggered per NCCN protocol", pathwayState: "active-treatment", pathwayTransition: null, agents: [{ id: "pathway", action: "Records Cycle 3. Midpoint restaging triggered per pathway protocol. Orders CT Chest/Abd/Pelvis + LVEF echo (trastuzumab cardiac monitoring)" }, { id: "monitor", action: "3-cycle cardiac check: LVEF echocardiogram scheduled per trastuzumab cardiotoxicity CQL monitoring rule" }], ledger: { category: "Drug + Facility", amount: 15680, color: C.drug, icon: "→" }, totalSpent: 53745 },
+  { id: 14, time: "Day 65 16:04", topic: "imaging.result", type: "imaging", typeLabel: "IMG", fhir: "DiagnosticReport, ImagingStudy", source: "Radiology (CT Chest/Abd/Pelvis)", event: "Restaging CT: 40% tumor reduction (RECIST partial response). No new metastases. NOT progression — episode continues (if progression, episode would close and restaging/new episode would begin)", pathwayState: "active-treatment", pathwayTransition: null, agents: [{ id: "pathway", action: "Ingests DiagnosticReport: partial response (≥ 30% reduction) meets NCCN continuation criteria. NOT progression → episode remains open. Continue TCHP ×3 more cycles. Schedules surgical referral for Week 18" }, { id: "scribe", action: "Documents restaging results + pathway continuation rationale. Updates CarePlan narrative with imaging findings" }, { id: "referral", action: "Activates surgical oncology referral. Queries OVHN directory: Dr. Patel recommended — highest lumpectomy volume, in-network, 2.8mi. Drafts ServiceRequest for MD approval" }, { id: "monitor", action: "Adjusts surveillance: increases cardiac monitoring frequency. Updates CQL thresholds based on cumulative trastuzumab dose" }], ledger: { category: "Imaging (external)", amount: 1850, color: C.facility, icon: "→" }, totalSpent: 55595 },
+  { id: 15, time: "Day 66–122", topic: "pharmacy.dispense", type: "pharmacy", typeLabel: "Rx", fhir: "MedicationAdministration ×3", source: "Infusion Suite", event: "Cycles 4–6 completed without significant toxicity. G-CSF prophylaxis maintained. Triage team: 0 ED visits, 0 hospitalizations throughout treatment", pathwayState: "active-treatment", pathwayTransition: null, agents: [{ id: "pathway", action: "Tracks Cycles 4–6. Cumulative spend $71,800. Headroom: $15,600 remaining. All triage calls answered within 1-hour SLA" }, { id: "monitor", action: "Continuous COME HOME surveillance. Cycle 6 LVEF echo: 58% (normal). No cardiac toxicity detected" }], ledger: { category: "Drug + Facility ×3", amount: 16205, color: C.drug, icon: "→" }, totalSpent: 71800 },
+  { id: 16, time: "Day 132", topic: "claims.facility", type: "claims", typeLabel: "CLM", fhir: "Claim (unadjudicated)", source: "Hospital → Payer Feed", event: "Lumpectomy + sentinel node biopsy. Surgical pathology: pCR (pathological complete response). Unadjudicated hospital claim arrives via payer streaming feed", pathwayState: "active-treatment", pathwayTransition: null, agents: [{ id: "pathway", action: "Ingests external hospital claim from payer unadjudicated claims feed — the \"secret sauce\" of MASON real-time cost visibility. Accrues surgical cost to Virtual Account" }, { id: "scribe", action: "Links surgical encounter to EpisodeOfCare. Documents surgical pathology: pCR achieved. Updates CarePlan with outcome" }], ledger: { category: "Surgery (external)", amount: 4200, color: C.facility, icon: "→" }, totalSpent: 76000 },
+  { id: 17, time: "Day 147–175", topic: "claims.facility", type: "claims", typeLabel: "CLM", fhir: "Claim (unadjudicated) ×20", source: "Radiation Oncology → Payer Feed", event: "Adjuvant radiation: 20 fractions completed. Daily unadjudicated claims from external radiation facility stream into Virtual Account via payer feed", pathwayState: "active-treatment", pathwayTransition: null, agents: [{ id: "pathway", action: "Ingests 20 daily radiation claims from payer streaming feed. Running total: $78,200. Headroom: $9,200. Practice can compare radiation facility pricing for future episodes" }, { id: "monitor", action: "Transitions to survivorship monitoring protocol. Adjusts PCC-39 subscriptions: long-term cardiac follow-up (trastuzumab) + recurrence screening schedule" }], ledger: { category: "Radiation (external)", amount: 2200, color: C.facility, icon: "→" }, totalSpent: 78200 },
+  { id: 18, time: "Day 180", topic: "mason.settlement", type: "claims", typeLabel: "VBC", fhir: "CarePlan (completed), MeasureReport, Claim (settlement)", source: "MASON Settlement Engine", event: "EPISODE CLOSED: All pathway activities completed. Virtual Account finalized. Quality metrics: 100% pathway adherence, 0 ED visits, 0 hospitalizations, pCR. Shared savings: $9,200", pathwayState: "active-treatment", pathwayTransition: "settlement", agents: [{ id: "pathway", action: "Closes CarePlan + EpisodeOfCare. Finalizes Virtual Account: Spend $78,200 vs. Target Price $87,400 = $9,200 under budget. Quality parameters met → shared savings eligible. Generates MeasureReport for payer" }, { id: "scribe", action: "Compiles comprehensive episode summary for payer settlement: treatment timeline, toxicity events, imaging, surgical pathology (pCR), quality outcomes, cost reconciliation" }], ledger: { category: "✓ SHARED SAVINGS", amount: -9200, color: C.savings, icon: "←" }, totalSpent: 78200 },
+];
+
+const AGENTS = {
+  scribe: { name: "Scribe", color: C.scribe, letter: "S" },
+  monitor: { name: "Monitor", color: C.monitor, letter: "M" },
+  referral: { name: "Referral", color: C.referral, letter: "R" },
+  auth: { name: "Auth", color: C.auth, letter: "A" },
+  pathway: { name: "Pathway", color: C.pathway, letter: "P" },
+};
+
+const TYPE_COLORS = { clinical: C.clinical, lab: C.lab, pharmacy: C.pharmacy, claims: C.claims, admin: C.admin, iot: C.iot, imaging: C.imaging };
+
+/* ═══════════════════════════════════════════════════════════════
+   STATE & RENDERING
+   ═══════════════════════════════════════════════════════════════ */
+let state = { idx: -1, playing: false, playInterval: null };
+
+function getEffectiveState() {
+  if (state.idx < 0) return "enrollment";
+  let s = EVENTS[0].pathwayState;
+  for (let i = 0; i <= state.idx; i++) {
+    if (i > 0 && EVENTS[i].pathwayState) s = EVENTS[i].pathwayState;
+    if (i < state.idx && EVENTS[i].pathwayTransition) s = EVENTS[i].pathwayTransition;
+  }
+  return s;
+}
+
+function $(id) { return document.getElementById(id); }
+
+function render() {
+  const ev = state.idx >= 0 ? EVENTS[state.idx] : null;
+  const effectiveState = getEffectiveState();
+  const currentPathwayObj = PATHWAY_STATES.find(s => s.id === effectiveState);
+
+  // Update status indicator
+  const statusDot = $('status-dot');
+  statusDot.style.background = state.playing ? C.savings : C.muted;
+  statusDot.style.animation = state.playing ? 'pulse 0.8s infinite' : 'none';
+
+  // Update topic tag in header
+  const topicHeader = $('topic-header');
+  topicHeader.innerHTML = ev ? createTopicTag(ev.topic) : '';
+
+  // Update event counter
+  $('event-counter').textContent = `${state.idx + 1} / ${EVENTS.length}`;
+
+  // Update event rows
+  EVENTS.forEach((e, i) => {
+    const row = $(`event-row-${i}`);
+    const isActive = i === state.idx;
+    const isProcessed = i <= state.idx;
+    const tc = TYPE_COLORS[e.type];
+    
+    row.style.background = isActive ? C.bgRow : 'transparent';
+    row.style.borderLeft = isActive ? `2px solid ${tc}` : '2px solid transparent';
+    row.style.opacity = isProcessed ? 1 : 0.7;
+    
+    const timeSpan = row.querySelector('.ev-time');
+    timeSpan.style.color = isProcessed ? C.text : C.unclicked;
+    timeSpan.style.fontWeight = isActive ? 600 : 500;
+    
+    const eventSpan = row.querySelector('.ev-text');
+    eventSpan.style.color = isProcessed ? C.text : C.unclicked;
+    eventSpan.style.fontWeight = isActive ? 700 : 500;
+  });
+
+  // Scroll to active row
+  if (state.idx >= 0) {
+    const row = $(`event-row-${state.idx}`);
+    if (row) row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  // Update pathway lifecycle
+  renderPathwayLifecycle(effectiveState, ev ? ev.pathwayTransition : null);
+
+  // Update pathway description
+  const pathwayDesc = $('pathway-desc');
+  if (currentPathwayObj) {
+    pathwayDesc.textContent = currentPathwayObj.desc;
+    pathwayDesc.style.color = currentPathwayObj.color;
+    pathwayDesc.style.display = 'block';
+  } else {
+    pathwayDesc.style.display = 'none';
+  }
+
+  // Update virtual account
+  renderVirtualAccount();
+
+  // Update event detail panel
+  renderEventDetail(ev);
+
+  // Update buttons
+  const prevBtn = $('prev-btn');
+  prevBtn.disabled = state.idx <= 0;
+  prevBtn.style.color = state.idx <= 0 ? C.faint : C.text;
+  prevBtn.style.cursor = state.idx <= 0 ? 'default' : 'pointer';
+
+  const playBtn = $('play-btn');
+  playBtn.textContent = state.playing ? '⏸ Pause' : '▶ Stream Events';
+  playBtn.style.background = state.playing ? C.auth : C.pathway;
+
+  const nextBtn = $('next-btn');
+  nextBtn.disabled = state.idx >= EVENTS.length - 1;
+  nextBtn.style.background = state.idx >= EVENTS.length - 1 ? C.bgCard : C.pathway;
+  nextBtn.style.color = state.idx >= EVENTS.length - 1 ? C.faint : '#fff';
+  nextBtn.style.cursor = state.idx >= EVENTS.length - 1 ? 'default' : 'pointer';
+}
+
+function renderPathwayLifecycle(currentState, transitionTo) {
+  const currentIdx = PATHWAY_STATES.findIndex(p => p.id === currentState);
+  
+  PATHWAY_STATES.forEach((s, i) => {
+    const isCurrent = s.id === currentState;
+    const isNext = s.id === transitionTo;
+    const isPast = currentIdx > i;
+    
+    const box = $(`pathway-box-${i}`);
+    box.style.background = isCurrent ? s.color + '10' : isNext ? s.color + '08' : 'transparent';
+    box.style.border = `1.5px solid ${isCurrent ? s.color : isNext ? s.color + '50' : isPast ? s.color + '30' : C.border}`;
+    
+    const nextBadge = box.querySelector('.next-badge');
+    if (nextBadge) nextBadge.style.display = isNext ? 'block' : 'none';
+    
+    const diagram = box.querySelector('.diagram');
+    diagram.style.color = isCurrent ? s.color : isPast ? s.color + '70' : C.faint;
+    
+    const label = box.querySelector('.label');
+    label.style.color = isCurrent ? s.color : isPast ? s.color + '80' : C.faint;
+    
+    const check = box.querySelector('.check');
+    if (check) check.style.display = isPast ? 'inline' : 'none';
+    
+    const dot = box.querySelector('.current-dot');
+    if (dot) dot.style.display = isCurrent ? 'block' : 'none';
+    
+    const arrow = $(`pathway-arrow-${i}`);
+    if (arrow) {
+      arrow.querySelector('path').setAttribute('stroke', isPast ? s.color + '40' : C.faint);
+    }
+  });
+}
+
+function renderVirtualAccount() {
+  const container = $('virtual-account');
+  const targetSet = state.idx >= 3;
+  const currentSpent = state.idx >= 0 ? EVENTS[state.idx].totalSpent : 0;
+  const target = 87400;
+  const headroom = target - currentSpent;
+  const pct = Math.min((currentSpent / target) * 100, 100);
+
+  let html = '';
+  
+  if (!targetSet && state.idx >= 0) {
+    html = `<div style="font-size:10px;color:${C.dim};font-style:italic;text-align:center;padding:6px 0">Virtual Account not yet initialized. Target Price is set when treatment plan is documented in EMR (Master Trigger).</div>`;
+  }
+  
+  if (targetSet) {
+    const categories = {};
+    EVENTS.filter((e, i) => i <= state.idx && e.ledger && e.ledger.amount > 0).forEach(e => {
+      const cat = e.ledger.category.split(' (')[0].split(' ×')[0];
+      categories[cat] = (categories[cat] || 0) + e.ledger.amount;
+    });
+
+    html = `
+      <div style="margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:3px">
+          <span style="color:${C.dim}">Spent: <span style="color:${C.text};font-weight:700">$${currentSpent.toLocaleString()}</span></span>
+          <span style="color:${C.dim}">Target: <span style="color:${C.target};font-weight:700">$${target.toLocaleString()}</span></span>
+        </div>
+        <div style="height:8px;background:${C.bgCard};border-radius:4px;overflow:hidden;border:1px solid ${C.border}">
+          <div style="height:100%;border-radius:4px;transition:width 0.6s ease;width:${pct}%;background:${pct > 90 ? `linear-gradient(90deg,${C.auth},${C.auth}cc)` : `linear-gradient(90deg,${C.pathway},${C.pathway}aa)`}"></div>
+        </div>
+        <div style="text-align:right;font-size:10px;margin-top:2px;color:${headroom > 0 ? C.savings : C.auth};font-weight:600">
+          ${headroom > 0 ? `Headroom: $${headroom.toLocaleString()}` : `Over Target: $${Math.abs(headroom).toLocaleString()}`}
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:2px">
+        ${Object.entries(categories).map(([cat, amt]) => `
+          <div style="display:flex;justify-content:space-between;font-size:10px;padding:1px 0">
+            <span style="color:${C.dim}">${cat}</span>
+            <span style="color:${C.text};font-family:'IBM Plex Mono',monospace;font-weight:500">$${amt.toLocaleString()}</span>
+          </div>
+        `).join('')}
+      </div>
+    `;
+    
+    if (state.idx >= 0 && EVENTS[state.idx].ledger) {
+      const ledger = EVENTS[state.idx].ledger;
+      html += `
+        <div style="margin-top:6px;padding:5px 8px;border-radius:4px;background:${ledger.color}0A;border-left:3px solid ${ledger.color};animation:fadeSlideIn 0.3s ease;font-size:10px">
+          <span style="color:${ledger.color};font-weight:600">${ledger.icon} ${ledger.category}:</span>
+          <span style="color:${C.text};font-family:'IBM Plex Mono',monospace">${ledger.amount > 0 ? '+' : ''}$${Math.abs(ledger.amount).toLocaleString()}</span>
+        </div>
+      `;
+    }
+  }
+  
+  container.innerHTML = html;
+}
+
+function renderEventDetail(ev) {
+  const container = $('event-detail');
+  const header = $('event-detail-header');
+  
+  header.textContent = ev ? 'Event Detail & Agent Reactions' : 'Select an event or press Stream Events';
+  
+  if (!ev) {
+    container.innerHTML = '';
+    return;
+  }
+  
+  let html = `
+    <div style="animation:fadeSlideIn 0.3s ease">
+      <div style="padding:10px 12px;border-radius:6px;background:${C.bgPanel};margin-bottom:10px;border:1px solid ${C.border}">
+        <div style="font-size:10px;color:${C.muted};margin-bottom:3px">
+          <span style="font-family:'IBM Plex Mono',monospace">${ev.time}</span> • ${createTopicTag(ev.topic)} • <span style="color:${C.muted};font-size:9px">${ev.source}</span>
+        </div>
+        <div style="font-size:12px;color:${C.text};line-height:1.5;margin-bottom:6px">${ev.event}</div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap">
+          ${ev.fhir.split(', ').map(r => `<span style="font-size:9px;padding:1px 6px;border-radius:3px;background:${C.clinical}0A;border:1px solid ${C.clinical}20;color:${C.clinical};font-family:'IBM Plex Mono',monospace">${r}</span>`).join('')}
+        </div>
+      </div>
+  `;
+  
+  if (ev.pathwayTransition) {
+    const transitionState = PATHWAY_STATES.find(s => s.id === ev.pathwayTransition);
+    const fromState = PATHWAY_STATES.find(s => s.id === ev.pathwayState);
+    html += `
+      <div style="padding:6px 10px;border-radius:4px;margin-bottom:10px;font-size:10.5px;background:${transitionState.color}0A;border-left:3px solid ${transitionState.color};color:${transitionState.color};font-weight:600;line-height:1.4">
+        Pathway Transition: ${fromState?.label} → ${transitionState?.label}
+        <div style="font-size:9.5px;font-weight:400;color:${C.dim};margin-top:2px">${transitionState?.detail}</div>
+      </div>
+    `;
+  }
+  
+  html += `<div style="display:flex;flex-direction:column;gap:6px">`;
+  ev.agents.forEach((a, i) => {
+    const agent = AGENTS[a.id];
+    html += `
+      <div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;background:${agent.color}06;border-left:3px solid ${agent.color};animation:fadeSlideIn 0.3s ease ${i * 0.08}s both">
+        <div style="width:22px;height:22px;border-radius:50%;flex-shrink:0;background:${agent.color};display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#fff">${agent.letter}</div>
+        <div>
+          <div style="font-size:10px;font-weight:600;color:${agent.color};margin-bottom:2px">${agent.name} Agent</div>
+          <div style="font-size:11.5px;color:${C.dim};line-height:1.55">${a.action}</div>
+        </div>
+      </div>
+    `;
+  });
+  html += `</div></div>`;
+  
+  container.innerHTML = html;
+}
+
+function createTopicTag(topic) {
+  return `<span style="font-family:'IBM Plex Mono',monospace;font-size:10px;padding:1px 7px;border-radius:3px;background:${C.bgCard};border:1px solid ${C.border};color:${C.muted}">${topic}</span>`;
+}
+
+function createAgentBadges(ev) {
+  return Object.entries(AGENTS).map(([k, a]) => {
+    const isActive = ev && ev.agents.some(x => x.id === k);
+    return `
+      <div style="display:flex;align-items:center;gap:3px;padding:2px 7px;border-radius:10px;border:1px solid ${isActive ? a.color : C.border};opacity:${isActive ? 1 : 0.35};transition:all 0.3s">
+        <div style="width:16px;height:16px;border-radius:50%;font-size:8px;font-weight:700;background:${a.color};color:#fff;display:flex;align-items:center;justify-content:center">${a.letter}</div>
+        <span style="font-size:9.5px;color:${a.color};font-weight:600">${a.name}</span>
+      </div>
+    `;
+  }).join('');
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   EVENT HANDLERS
+   ═══════════════════════════════════════════════════════════════ */
+function setIdx(newIdx) {
+  state.idx = newIdx;
+  render();
+}
+
+function togglePlay() {
+  if (state.playing) {
+    state.playing = false;
+    if (state.playInterval) clearInterval(state.playInterval);
+  } else {
+    state.playing = true;
+    if (state.idx < 0 || state.idx >= EVENTS.length - 1) state.idx = 0;
+    state.playInterval = setInterval(() => {
+      if (state.idx < EVENTS.length - 1) {
+        state.idx++;
+        render();
+      } else {
+        state.playing = false;
+        clearInterval(state.playInterval);
+        render();
+      }
+    }, 2400);
+  }
+  render();
+}
+
+function reset() {
+  state.idx = -1;
+  state.playing = false;
+  if (state.playInterval) clearInterval(state.playInterval);
+  render();
+}
+
+function prevEvent() {
+  if (state.idx > 0) setIdx(state.idx - 1);
+}
+
+function nextEvent() {
+  if (state.idx < EVENTS.length - 1) setIdx(state.idx + 1);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   INITIAL RENDER
+   ═══════════════════════════════════════════════════════════════ */
+function init() {
+  const root = document.getElementById('root');
+  
+  root.innerHTML = `
+    <div style="min-height:100vh;background:${C.bg};color:${C.text};font-family:'IBM Plex Sans','Segoe UI',system-ui,sans-serif;display:grid;grid-template-rows:auto auto 1fr auto;height:100vh">
+      
+      <!-- HEADER -->
+      <div style="padding:10px 20px 8px;border-bottom:1px solid ${C.border}">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div>
+            <div style="font-size:9px;font-weight:600;letter-spacing:2px;color:${C.pathway};text-transform:uppercase">MASON 3.0 • Zoadigm OVHN • Event-Driven Architecture</div>
+            <h1 style="font-size:17px;font-weight:700;color:${C.text};margin:1px 0">Clinical Event Stream → Pathway Lifecycle → Episode Settlement</h1>
+            <div style="font-size:10.5px;color:${C.dim}">Patient: Maria S., 58 • HER2+ Breast Ca Stage IIIA • OPC: Breast-HER2+-III • NCCN TCHP Pathway • Target: $87,400</div>
+          </div>
+          <div id="agent-badges" style="display:flex;gap:5px">
+            ${createAgentBadges(null)}
+          </div>
+        </div>
+      </div>
+      
+      <!-- PATHWAY LIFECYCLE -->
+      <div style="padding:6px 20px 8px;border-bottom:1px solid ${C.border};background:${C.bgPanel};display:flex;align-items:center;gap:12px">
+        <div style="font-size:8px;font-weight:600;letter-spacing:1.5px;color:${C.muted};text-transform:uppercase;white-space:nowrap;flex-shrink:0">Pathway</div>
+        <div style="flex:1;display:flex;align-items:center;gap:0">
+          ${PATHWAY_STATES.map((s, i) => `
+            <div style="display:flex;align-items:center;flex:1">
+              <div id="pathway-box-${i}" style="flex:1;text-align:center;padding:4px 3px;border-radius:4px;position:relative;background:transparent;border:1.5px solid ${C.border};transition:all 0.3s">
+                <div class="next-badge" style="display:none;position:absolute;top:-7px;left:50%;transform:translateX(-50%);font-size:6px;padding:0 4px;border-radius:2px;white-space:nowrap;background:${s.color};color:#fff;font-weight:700;animation:pulse 1.2s infinite">NEXT</div>
+                <div style="display:flex;align-items:center;justify-content:center;gap:3px">
+                  <span class="diagram" style="font-size:7px;color:${C.faint};font-weight:600;font-family:'IBM Plex Mono',monospace">${s.diagram}</span>
+                  <span class="label" style="font-size:9.5px;font-weight:700;color:${C.faint}">${s.label}</span>
+                  <span class="check" style="font-size:8px;color:${s.color}70;display:none">✓</span>
+                </div>
+                <div class="current-dot" style="display:none;position:absolute;bottom:-4px;left:50%;transform:translateX(-50%);width:5px;height:5px;border-radius:50%;background:${s.color};box-shadow:0 0 6px ${s.color}60"></div>
+              </div>
+              ${i < PATHWAY_STATES.length - 1 ? `<svg id="pathway-arrow-${i}" width="14" height="10" viewBox="0 0 14 10" style="flex-shrink:0"><path d="M0 5 L9 5 M7 2 L12 5 L7 8" fill="none" stroke="${C.faint}" stroke-width="1.2"/></svg>` : ''}
+            </div>
+          `).join('')}
+        </div>
+        <div id="pathway-desc" style="font-size:8.5px;font-weight:500;font-style:italic;max-width:260px;text-align:right;line-height:1.3;flex-shrink:0;display:none"></div>
+      </div>
+      
+      <!-- MAIN LAYOUT -->
+      <div style="display:grid;grid-template-columns:38% 1fr;overflow:hidden">
+        
+        <!-- LEFT: Event Stream -->
+        <div style="display:flex;flex-direction:column;border-right:1px solid ${C.border};overflow:hidden">
+          <div style="padding:5px 10px;border-bottom:1px solid ${C.border};background:${C.bgPanel};display:flex;justify-content:space-between;align-items:center">
+            <div style="display:flex;align-items:center;gap:6px">
+              <div id="status-dot" style="width:5px;height:5px;border-radius:50%;background:${C.muted}"></div>
+              <span style="font-size:9px;font-weight:600;color:${C.dim};text-transform:uppercase;letter-spacing:1px">Event Log</span>
+              <span id="topic-header"></span>
+            </div>
+            <span id="event-counter" style="font-size:9px;color:${C.muted}">0 / ${EVENTS.length}</span>
+          </div>
+          <div id="event-stream" style="flex:1;overflow-y:auto;padding:2px 4px">
+            ${EVENTS.map((e, i) => {
+              const tc = TYPE_COLORS[e.type];
+              return `
+                <div id="event-row-${i}" onclick="setIdx(${i})" style="display:grid;grid-template-columns:72px 38px 1fr 44px;gap:4px;align-items:center;padding:5px 8px;cursor:pointer;border-radius:4px;font-size:11px;background:transparent;border-left:2px solid transparent;opacity:0.7;transition:all 0.15s">
+                  <span class="ev-time" style="font-family:'IBM Plex Mono',monospace;color:${C.unclicked};font-size:10px;font-weight:500">${e.time}</span>
+                  <span style="font-family:'IBM Plex Mono',monospace;font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px;text-align:center;background:${tc}20;color:${tc};border:1px solid ${tc}35">${e.typeLabel}</span>
+                  <span class="ev-text" style="color:${C.unclicked};line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10.5px;font-weight:500">${e.event}</span>
+                  <div style="display:flex;gap:2px;justify-content:flex-end">
+                    ${e.agents.map(a => `<div style="width:15px;height:15px;border-radius:50%;font-size:7px;font-weight:700;display:flex;align-items:center;justify-content:center;background:${AGENTS[a.id].color}20;color:${AGENTS[a.id].color};border:1px solid ${AGENTS[a.id].color}35">${AGENTS[a.id].letter}</div>`).join('')}
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        </div>
+        
+        <!-- RIGHT: Detail Panels -->
+        <div style="display:grid;grid-template-rows:auto 1fr;overflow:hidden">
+          <!-- Virtual Account -->
+          <div style="padding:8px 16px;border-bottom:1px solid ${C.border};background:${C.bgPanel}">
+            <div style="font-size:9px;font-weight:600;letter-spacing:1.5px;color:${C.target};text-transform:uppercase;margin-bottom:6px">OPC Virtual Account • Real-Time Unadjudicated Claims</div>
+            <div id="virtual-account"></div>
+          </div>
+          
+          <!-- Event Detail -->
+          <div style="flex:1;overflow-y:auto;padding:10px 16px">
+            <div id="event-detail-header" style="font-size:9px;font-weight:600;letter-spacing:1.5px;color:${C.muted};text-transform:uppercase;margin-bottom:8px">Select an event or press Stream Events</div>
+            <div id="event-detail"></div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- CONTROLS -->
+      <div style="padding:6px 20px;border-top:1px solid ${C.border};background:${C.bgPanel};display:flex;justify-content:space-between;align-items:center">
+        <button id="prev-btn" onclick="prevEvent()" style="padding:5px 14px;border-radius:4px;border:1px solid ${C.border};background:${C.bg};color:${C.faint};cursor:default;font-size:11px;font-weight:600">← Prev</button>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button id="play-btn" onclick="togglePlay()" style="padding:5px 18px;border-radius:4px;border:none;background:${C.pathway};color:#fff;cursor:pointer;font-size:11px;font-weight:600">▶ Stream Events</button>
+          <button onclick="reset()" style="padding:5px 12px;border-radius:4px;border:1px solid ${C.border};background:${C.bg};color:${C.muted};cursor:pointer;font-size:11px;font-weight:600">Reset</button>
+        </div>
+        <button id="next-btn" onclick="nextEvent()" style="padding:5px 14px;border-radius:4px;border:none;background:${C.pathway};color:#fff;cursor:pointer;font-size:11px;font-weight:600">Next →</button>
+      </div>
+    </div>
+  `;
+  
+  render();
+}
+
+// Start the app
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>
